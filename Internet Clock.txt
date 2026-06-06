@@ -1,0 +1,415 @@
+//Arduino code 
+/* -------------------------------------------------
+Copyright (c)
+Arduino projects by Tech Talkies YouTube Channel.
+Please credit if you use.
+https://www.youtube.com/@techzaiduu
+-------------------------------------------------*/
+#include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
+#include <WiFi.h>
+#include "time.h"
+#include <AsyncHTTPRequest_Generic.h>
+#include <ArduinoJson.h>
+#include <Fonts\FreeSansBold9pt7b.h>
+#include "clockFont.h"
+
+// Change these to whatever suits
+const char* ssid = "iphone";
+const char* password = "12345678";
+
+const long gmtOffset_sec = 19800; // Time zone offset in seconds
+const int daylightOffset_sec = 0;
+String latitude = "33.73073501299485";
+String longitude = "75.14634935454478";
+String apiKey = "00f38e5701138c298c08770e4410c5b9";
+
+#define R1_PIN 19
+#define G1_PIN 13
+#define B1_PIN 18
+#define R2_PIN 5
+#define G2_PIN 12
+#define B2_PIN 17
+
+#define A_PIN 16
+#define B_PIN 14
+#define C_PIN 4
+#define D_PIN 27
+#define E_PIN -1
+
+#define LAT_PIN 26
+// --- CHANGED PINS TO AVOID ESP32 STRAPPING PIN INTERFERENCE ---
+#define OE_PIN 22  // Previously 15
+#define CLK_PIN 23 // Previously 2
+// --------------------------------------------------------------
+
+const char* ntpServer = "pool.ntp.org";
+String serverName = "http://api.openweathermap.org/data/2.5/weather?lat=" + latitude + "&lon=" + longitude + "&appid=" + apiKey + "&units=metric";
+
+HUB75_I2S_CFG::i2s_pins _pins = { R1_PIN, G1_PIN, B1_PIN, R2_PIN, G2_PIN, B2_PIN, A_PIN, B_PIN, C_PIN, D_PIN, E_PIN, LAT_PIN, OE_PIN, CLK_PIN };
+
+// Declare the display pointer globally so all functions can use it
+MatrixPanel_I2S_DMA* dma_display = nullptr;
+
+AsyncHTTPRequest request;
+bool readWeather = false;
+bool weatherUpdated = false;
+const char* weather_0_main;
+double main_tempF;
+String weather, temperature;
+int prevMin = 0, prevHour = 0, prevSecond = 0;
+char* daysList[] = { "DAY", "SUNDAY", "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "WEDNESDAY", "SATURDAY" };
+
+void setup() {
+  Serial.begin(115200);
+
+  // --- ANTI-GHOSTING CONFIGURATION ---
+  HUB75_I2S_CFG mxconfig(
+    64,    // Module width
+    32,    // Module height
+    1,     // chain length
+    _pins  // pin mapping
+  );
+  
+  // These two lines are the software fix for left-side ghosting
+  mxconfig.latch_blanking = 6; // Gives the panel time to switch rows before sending data
+  mxconfig.clkphase = false;   // Reverses clock phase to align data perfectly
+  
+  dma_display = new MatrixPanel_I2S_DMA(mxconfig);
+  dma_display->begin();             // setup the LED matrix
+  // -----------------------------------
+
+  dma_display->setBrightness8(255);  // 0-255
+  dma_display->setTextWrap(false);  // Don't wrap at end of line - will do ourselves
+  dma_display->clearScreen();
+  dma_display->setTextColor(dma_display->color444(15, 15, 0));
+
+  // Connect to Wi-Fi
+  dma_display->clearScreen();
+  dma_display->println("Connecting to ");
+  dma_display->print(ssid);
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    dma_display->print(".");
+  }
+
+  dma_display->clearScreen();
+  dma_display->setCursor(0, 0);
+  dma_display->println("WiFi connected.");
+  dma_display->clearScreen();
+
+  weather = "WEATHER";
+
+  // Init and get the time
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  request.onReadyStateChange(requestCB);
+  sendWeatherRequest();
+
+  uint16_t lineColor = dma_display->color565(100, 100, 100);
+  dma_display->drawFastHLine(0, 7, 64, lineColor);
+  dma_display->drawFastHLine(0, 23, 64, lineColor);
+}
+
+void loop() {
+  delay(1000);
+  printLocalTime();
+}
+
+void printLocalTime() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    Serial.println("Failed to obtain time");
+    return;
+  }
+  if (prevMin > 58) prevMin = 0;
+  if (prevHour > 22) prevHour = 0;
+
+  uint16_t blank = dma_display->color444(0, 0, 0);  // 0 -15
+  uint16_t colorHour = dma_display->color565(255, 255, 0);
+  uint16_t colorSeconds = dma_display->color565(255, 171, 0);
+  uint16_t colorWeather = dma_display->color565(192, 255, 194);
+  uint16_t colortemp = dma_display->color565(0, 230, 230);
+  uint16_t colorDay = dma_display->color565(100, 200, 0);
+
+  if (weatherUpdated) {
+    dma_display->fillRect(0, 0, 64, 6, blank);
+    dma_display->setFont(&TTFont);
+    dma_display->setTextColor(colorWeather);
+    dma_display->setCursor(0, 5);
+    dma_display->print(weather);
+    dma_display->setCursor(47, 5);
+    dma_display->setTextColor(colortemp);
+    dma_display->print(temperature);
+    dma_display->print("`C");
+
+    dma_display->setFont(&TechTalkies);
+    dma_display->setCursor(35, 7);
+    dma_display->setTextColor(dma_display->color565(100, 0, 255));
+    dma_display->print("|");
+
+    weatherUpdated = false;
+  }
+
+  if (prevHour < timeinfo.tm_hour) {
+    prevHour = timeinfo.tm_hour;
+
+    dma_display->fillRect(3, 9, 24, 13, blank);
+    dma_display->setFont(&FreeSansBold9pt7b);
+    dma_display->setTextColor(colorHour);
+    dma_display->setCursor(3, 21);
+    dma_display->print(&timeinfo, "%I:");
+
+    dma_display->fillRect(48, 16, 29, 6, blank);
+    dma_display->setFont(&TTFont);
+    dma_display->setCursor(48, 21);
+    dma_display->setTextColor(colorSeconds);
+    if (timeinfo.tm_hour < 13)
+      dma_display->print("Am");
+    else
+      dma_display->print("Pm");
+
+    dma_display->setTextColor(colorDay);
+    dma_display->fillRect(0, 26, 64, 7, blank);
+    dma_display->setCursor(0, 30);
+    dma_display->print(daysList[timeinfo.tm_wday]);
+    dma_display->setCursor(54, 30);
+    char dateToday[3] = "";
+    sprintf(dateToday, "%0d", timeinfo.tm_mday);
+    dma_display->print(dateToday);
+
+    // Weather updated every 1 hour
+    sendWeatherRequest();
+  }
+  if (prevMin < timeinfo.tm_min) {
+    prevMin = timeinfo.tm_min;
+    dma_display->fillRect(28, 9, 20, 13, blank);
+    dma_display->setFont(&FreeSansBold9pt7b);
+    dma_display->setTextColor(colorHour);
+    dma_display->setCursor(27, 21);
+    dma_display->print(&timeinfo, "%M");
+  }
+
+  dma_display->setFont();
+  dma_display->setCursor(48, 9);
+  dma_display->fillRect(48, 9, 23, 7, blank);
+  dma_display->setTextColor(colorSeconds);
+  dma_display->print(&timeinfo, "%S");
+}
+
+void sendWeatherRequest() {
+  static bool requestOpenResult;
+
+  if (request.readyState() == readyStateUnsent || request.readyState() == readyStateDone) {
+    requestOpenResult = request.open("GET", serverName.c_str());
+
+    if (requestOpenResult) {
+      // Only send() if open() returns true, or crash
+      request.send();
+    } else {
+      Serial.println(F("Can't send bad request"));
+    }
+  } else {
+    Serial.println(F("Not ready for request"));
+  }
+  readWeather = false;
+}
+
+void requestCB(void* optParm, AsyncHTTPRequest* request, int readyState) {
+  (void)optParm;
+
+  if (readyState == readyStateDone) {
+    if (request->responseHTTPcode() == 200) {
+      String payload = request->responseText();
+      Serial.println(F("\n**************************************"));
+      Serial.println(payload);
+      Serial.println(F("**************************************"));
+
+      // Allocate JsonBuffer
+      // Use arduinojson.org/assistant to compute the capacity.
+      const size_t capacity = JSON_OBJECT_SIZE(3) + JSON_ARRAY_SIZE(2) + 1024;
+      DynamicJsonDocument doc(capacity);
+
+      // Parse JSON object
+      JsonObject root = doc.as<JsonObject>();
+
+      DeserializationError error = deserializeJson(doc, payload);
+      if (error) {
+        Serial.println(F("Parsing failed!"));
+        Serial.println(error.c_str());
+        return;
+      }
+
+      // Decode JSON/Extract values
+      const char* value = doc["visibility"];
+      readWeather = false;
+
+      JsonObject weather_0 = doc["weather"][0];
+      weather_0_main = weather_0["main"];  // "Haze"
+      JsonObject main = doc["main"];
+      main_tempF = main["temp"];  // 301.86
+
+      Serial.print("weather,");
+      Serial.print(weather_0_main);
+      Serial.print(",");
+      Serial.println(main_tempF);
+
+      weather = weather_0_main;
+      weather.toUpperCase();
+      temperature = String(int(main_tempF));
+      weatherUpdated = true;
+    }
+  }
+}
+
+
+
+
+
+//header file "clockFont.h"
+
+/* -------------------------------------------------
+Copyright (c)
+Arduino projects by Tech Talkies YouTube Channel.
+Please credit if you use.
+https://www.youtube.com/@techzaiduu
+-------------------------------------------------*/
+
+const uint8_t Org_01Bitmaps[] PROGMEM = {
+  0xE8, 0xE8, 0xA0, 0x57, 0xD5, 0xF5, 0x00, 0xFD, 0x3E, 0x5F, 0x80, 0x88, 
+  0x88, 0x88, 0x80, 0xF4, 0xBF, 0x2E, 0x80, 0x80, 0x6A, 0x40, 0x95, 0x80, 
+  0xAA, 0x80, 0x5D, 0x00, 0xC0, 0xF0, 0x80, 0x08, 0x88, 0x88, 0x00, 0xF9, 
+  0x99, 0xF0, 0xF8, 0xF1, 0xF8, 0xF0, 0xF1, 0xF1, 0xF0, 0x99, 0xF1, 0x10, 
+  0xF8, 0xF1, 0xF0, 0xF8, 0xF9, 0xF0, 0xF1, 0x11, 0x10, 0xF9, 0xF9, 0xF0, 
+  0xF9, 0xF1, 0xF0, 0x90, 0xB0, 0x2A, 0x22, 0xF0, 0xF0, 0x88, 0xA8, 0xF8, 
+  0x4E, 0x02, 0x00, 0xFD, 0x6F, 0x0F, 0x80, 0xFC, 0x7F, 0x18, 0x80, 0xF4, 
+  0x7D, 0x1F, 0x00, 0xF8, 0x88, 0xF0, 0xE9, 0x99, 0xE0, 0xF8, 0xF8, 0xF0, 
+  0xF8, 0xF8, 0x80, 0xF8, 0xB9, 0xF0, 0x99, 0xF9, 0x90, 0xF9, 0x08, 0x4F, 
+  0x80, 0xF2, 0x2A, 0xE0, 0x9A, 0xCA, 0x90, 0x88, 0x88, 0xF0, 0xFD, 0x6B, 
+  0x5A, 0x80, 0x8B, 0x2A, 0xAA, 0x98, 0x00, 0xF9, 0x99, 0xF0, 0xF9, 0xF8, 
+  0x80, 0xF9, 0x9B, 0xF0, 0xE5, 0x3D, 0x29, 0x00, 0xF8, 0xF1, 0xF0, 0xF9, 
+  0x08, 0x42, 0x00, 0x99, 0x99, 0xF0, 0x8C, 0x62, 0xA2, 0x00, 0xAD, 0x6B, 
+  0x5F, 0x80, 0x8A, 0x88, 0xA8, 0x80, 0x8C, 0x54, 0x42, 0x00, 0xF8, 0x88, 
+  0x8F, 0x80, 0xEA, 0xC0, 0x82, 0x08, 0x20, 0x80, 0xD5, 0xC0, 0x54, 0xF8, 
+  0x80, 0xF1, 0xFF, 0x8F, 0x99, 0xF0, 0xF8, 0x8F, 0x1F, 0x99, 0xF0, 0xFF, 
+  0x8F, 0x00, 0x6B, 0xA4, 0xF9, 0x9F, 0x10, 0x8F, 0x99, 0x90, 0xF0, 0x55, 
+  0xC0, 0x8A, 0xF9, 0x90, 0xF8, 0xFD, 0x63, 0x10, 0xF9, 0x99, 0xF9, 0x9F, 
+  0xF9, 0x9F, 0x80, 0xF9, 0x9F, 0x20, 0xF8, 0x88, 0x47, 0x1F, 0x27, 0xC8, 
+  0x42, 0x00, 0x99, 0x9F, 0x99, 0x97, 0x8C, 0x6B, 0xF0, 0x96, 0x69, 0x99, 
+  0x9F, 0x10, 0x2E, 0x8F, 0x2B, 0x22, 0xF8, 0x89, 0xA8, 0x0F, 0xE0
+};
+
+const GFXglyph Org_01Glyphs[] PROGMEM = {
+  {     0,   0,   0,   6,    0,    1 },   // 0x20 ' '
+  {     1,   1,   5,   2,    0,   -4 },   // 0x21 '!'
+  {     2,   3,   1,   4,    0,   -4 },   // 0x22 '"'
+  {     3,   5,   5,   6,    0,   -4 },   // 0x23 '#'
+  {     7,   5,   5,   6,    0,   -4 },   // 0x24 '$'
+  {    11,   5,   5,   6,    0,   -4 },   // 0x25 '%'
+  {    15,   5,   5,   6,    0,   -4 },   // 0x26 '&'
+  {    19,   1,   1,   2,    0,   -4 },   // 0x27 '''
+  {    20,   2,   5,   3,    0,   -4 },   // 0x28 '('
+  {    22,   2,   5,   3,    0,   -4 },   // 0x29 ')'
+  {    24,   3,   3,   4,    0,   -3 },   // 0x2A '*'
+  {    26,   3,   3,   4,    0,   -3 },   // 0x2B '+'
+  {    28,   1,   2,   2,    0,    0 },   // 0x2C ','
+  {    29,   4,   1,   5,    0,   -2 },   // 0x2D '-'
+  {    30,   1,   1,   2,    0,    0 },   // 0x2E '.'
+  {    31,   5,   5,   6,    0,   -4 },   // 0x2F '/'
+  {    35,   4,   5,   5,    0,   -4 },   // 0x30 '0'
+  {    38,   1,   5,   2,    0,   -4 },   // 0x31 '1'
+  {    39,   4,   5,   5,    0,   -4 },   // 0x32 '2'
+  {    42,   4,   5,   5,    0,   -4 },   // 0x33 '3'
+  {    45,   4,   5,   5,    0,   -4 },   // 0x34 '4'
+  {    48,   4,   5,   5,    0,   -4 },   // 0x35 '5'
+  {    51,   4,   5,   5,    0,   -4 },   // 0x36 '6'
+  {    54,   4,   5,   5,    0,   -4 },   // 0x37 '7'
+  {    57,   4,   5,   5,    0,   -4 },   // 0x38 '8'
+  {    60,   4,   5,   5,    0,   -4 },   // 0x39 '9'
+  {    63,   1,   4,   2,    0,   -3 },   // 0x3A ':'
+  {    64,   1,   4,   2,    0,   -3 },   // 0x3B ';'
+  {    65,   3,   5,   4,    0,   -4 },   // 0x3C '<'
+  {    67,   4,   3,   5,    0,   -3 },   // 0x3D '='
+  {    69,   3,   5,   4,    0,   -4 },   // 0x3E '>'
+  {    71,   5,   5,   6,    0,   -4 },   // 0x3F '?'
+  {    75,   5,   5,   6,    0,   -4 },   // 0x40 '@'
+  {    79,   5,   5,   6,    0,   -4 },   // 0x41 'A'
+  {    83,   5,   5,   6,    0,   -4 },   // 0x42 'B'
+  {    87,   4,   5,   5,    0,   -4 },   // 0x43 'C'
+  {    90,   4,   5,   5,    0,   -4 },   // 0x44 'D'
+  {    93,   4,   5,   5,    0,   -4 },   // 0x45 'E'
+  {    96,   4,   5,   5,    0,   -4 },   // 0x46 'F'
+  {    99,   4,   5,   5,    0,   -4 },   // 0x47 'G'
+  {   102,   4,   5,   5,    0,   -4 },   // 0x48 'H'
+  {   105,   5,   5,   6,    0,   -4 },   // 0x49 'I'
+  {   109,   4,   5,   5,    0,   -4 },   // 0x4A 'J'
+  {   112,   4,   5,   5,    0,   -4 },   // 0x4B 'K'
+  {   115,   4,   5,   5,    0,   -4 },   // 0x4C 'L'
+  {   118,   5,   5,   6,    0,   -4 },   // 0x4D 'M'
+  {   122,   6,   5,   6,    0,   -4 },   // 0x4E 'N'
+  {   127,   4,   5,   5,    0,   -4 },   // 0x4F 'O'
+  {   130,   4,   5,   5,    0,   -4 },   // 0x50 'P'
+  {   133,   4,   5,   5,    0,   -4 },   // 0x51 'Q'
+  {   136,   5,   5,   5,    0,   -4 },   // 0x52 'R'
+  {   140,   4,   5,   5,    0,   -4 },   // 0x53 'S'
+  {   143,   5,   5,   6,    0,   -4 },   // 0x54 'T'
+  {   147,   4,   5,   5,    0,   -4 },   // 0x55 'U'
+  {   150,   5,   5,   6,    0,   -4 },   // 0x56 'V'
+  {   154,   5,   5,   6,    0,   -4 },   // 0x57 'W'
+  {   158,   5,   5,   6,    0,   -4 },   // 0x58 'X'
+  {   162,   5,   5,   6,    0,   -4 },   // 0x59 'Y'
+  {   166,   5,   5,   6,    0,   -4 },   // 0x5A 'Z'
+  {   170,   2,   5,   3,    0,   -4 },   // 0x5B '['
+  {   172,   5,   5,   6,    0,   -4 },   // 0x5C '\'
+  {   176,   2,   5,   3,    0,   -4 },   // 0x5D ']'
+  {   178,   3,   2,   4,    0,   -4 },   // 0x5E '^'
+  {   179,   5,   1,   6,    0,    1 },   // 0x5F '_'
+  {   180,   1,   1,   2,    0,   -4 },   // 0x60 '`'
+  {   181,   4,   4,   5,    0,   -3 },   // 0x61 'a'
+  {   183,   4,   5,   5,    0,   -4 },   // 0x62 'b'
+  {   186,   4,   4,   5,    0,   -3 },   // 0x63 'c'
+  {   188,   4,   5,   5,    0,   -4 },   // 0x64 'd'
+  {   191,   4,   5,   5,    0,   -3 },   // 0x65 'e'
+  {   194,   3,   5,   4,    0,   -4 },   // 0x66 'f'
+  {   196,   4,   5,   5,    0,   -3 },   // 0x67 'g'
+  {   199,   4,   5,   5,    0,   -4 },   // 0x68 'h'
+  {   202,   1,   4,   2,    0,   -3 },   // 0x69 'i'
+  {   203,   2,   5,   3,    0,   -3 },   // 0x6A 'j'
+  {   205,   4,   5,   5,    0,   -4 },   // 0x6B 'k'
+  {   208,   1,   5,   2,    0,   -4 },   // 0x6C 'l'
+  {   209,   5,   4,   6,    0,   -3 },   // 0x6D 'm'
+  {   212,   4,   4,   5,    0,   -3 },   // 0x6E 'n'
+  {   214,   4,   4,   5,    0,   -3 },   // 0x6F 'o'
+  {   216,   4,   5,   5,    0,   -3 },   // 0x70 'p'
+  {   219,   4,   5,   5,    0,   -3 },   // 0x71 'q'
+  {   222,   4,   4,   5,    0,   -3 },   // 0x72 'r'
+  {   224,   4,   4,   5,    0,   -3 },   // 0x73 's'
+  {   226,   5,   5,   6,    0,   -4 },   // 0x74 't'
+  {   230,   4,   4,   5,    0,   -3 },   // 0x75 'u'
+  {   232,   4,   4,   5,    0,   -3 },   // 0x76 'v'
+  {   234,   5,   4,   6,    0,   -3 },   // 0x77 'w'
+  {   237,   4,   4,   5,    0,   -3 },   // 0x78 'x'
+  {   239,   4,   5,   5,    0,   -3 },   // 0x79 'y'
+  {   242,   4,   4,   5,    0,   -3 },   // 0x7A 'z'
+  {   244,   3,   5,   4,    0,   -4 },   // 0x7B '{'
+  {   246,   1,   5,   2,    0,   -4 },   // 0x7C '|'
+  {   247,   3,   5,   4,    0,   -4 },   // 0x7D '}'
+  {   249,   5,   3,   6,    0,   -3 }    // 0x7E '~'
+};
+
+const GFXfont TTFont PROGMEM = {(uint8_t *)Org_01Bitmaps, 
+                                (GFXglyph *)Org_01Glyphs, 0x20, 0x7E,  7};
+
+// Approx. 943 bytes
+
+const uint8_t TechTalkies_Bitmaps[] PROGMEM = {
+  0xF8, 0x40, 0xF9, 0x42, 0x85, 0x02, 0x00
+};
+
+const GFXglyph TechTalkies_Glyphs[] PROGMEM = {
+  {     0,   7,   7,   7,    0,   -7 }    // 0x7C '|'
+};
+
+const GFXfont TechTalkies PROGMEM = {(uint8_t *) TechTalkies_Bitmaps,  (GFXglyph *)TechTalkies_Glyphs, 0x7C, 0x7C,  7};
+
+
