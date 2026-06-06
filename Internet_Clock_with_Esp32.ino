@@ -1,3 +1,7 @@
+//Created By Tech Zaid 
+//youtube https://www.youtube.com/@techzaiduu
+//instgram @kashurengineer
+
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
 #include <WiFi.h>
 #include "time.h"
@@ -12,9 +16,9 @@ const char* password = "12345678";
 
 const long gmtOffset_sec = 19800; // Time zone offset in seconds
 const int daylightOffset_sec = 0;
-String latitude = "33.730726126801294";
-String longitude = "75.14878599117765";
-String apiKey = "00f38e5701138c298c08770e4410c5b9";
+String latitude = "00000";  //enter latitude
+String longitude = "00000";  //longitude
+String apiKey = "your api key";
 
 #define R1_PIN 19
 #define G1_PIN 13
